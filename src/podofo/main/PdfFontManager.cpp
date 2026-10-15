@@ -214,7 +214,7 @@ PdfFont& PdfFontManager::GetOrCreateFont(const string_view& fontPath, unsigned f
     // NOTE: Canonical seems to handle also case insensitive paths,
     // converting them to actual casing
     auto normalizedPath = fs::canonical(fs::u8path(fontPath)).u8string();
-    PathDescriptor descriptor(normalizedPath, faceIndex, params.Encoding);
+    PathDescriptor descriptor(string_view(reinterpret_cast<const char*>(normalizedPath.data()), normalizedPath.size()), faceIndex, params.Encoding);
     auto found = m_cachedPaths.find(descriptor);
     if (found != m_cachedPaths.end())
         return *found->second;

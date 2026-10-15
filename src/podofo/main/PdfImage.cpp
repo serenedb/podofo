@@ -454,7 +454,8 @@ void PdfImage::setDataRaw(InputStream& stream, const PdfImageInfo& info, PdfImag
 PdfImageInfo PdfImage::Load(const string_view& filepath, const PdfImageLoadParams& params)
 {
     // TODO: This should not look at the extension
-    auto extension = fs::u8path(filepath).extension().u8string();
+    auto extensionBytes = fs::u8path(filepath).extension().u8string();
+    string extension(extensionBytes.begin(), extensionBytes.end());
     extension = utls::ToLower(extension);
 
     PdfImageInfo info;
