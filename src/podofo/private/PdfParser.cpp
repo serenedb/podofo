@@ -67,9 +67,9 @@ void PdfParser::Parse(InputStreamDevice& device)
     if (m_PdfVersion != PdfVersion::Unknown)
         clear();
 
+    ReadHeader(device);
     try
     {
-        ReadHeader(device);
         ReadDocumentStructure(device);
         ReadObjectEntries(device);
 
