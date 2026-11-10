@@ -1,12 +1,11 @@
 // SPDX-FileCopyrightText: 2025 Francesco Pretto <ceztko@gmail.com>
 // SPDX-License-Identifier: MIT-0
 
-#include <PdfTest.h>
+#include <catch.hpp>
 
 #include <podofo/private/SASLprep.h>
 
 using namespace std;
-using namespace PoDoFo;
 
 // Ported from https://github.com/reklatsmasters/saslprep/blob/master/test/index.js
 TEST_CASE("TestSALSprep")
