@@ -650,6 +650,10 @@ void addEntryChunk(vector<PdfTextEntry> &textEntries, StringChunkList &chunks, c
     }
 
     double strLength = computeLength(strings, glyphAddresses, lowerIndex, upperIndexLimit - 1);
+    const auto& lastState = strings[glyphAddresses[upperIndexLimit - 1].StringIndex]->State;
+    const double trailingSpacing = lastState.PdfState.CharSpacing * lastState.PdfState.FontScale
+        * Vector2(lastState.T_rm[0], lastState.T_rm[1]).GetLength();
+    strLength = std::max(0.0, strLength - trailingSpacing);
     nullable<Rect> bbox;
     if (options.ComputeBoundingBox)
         bbox = computeBoundingBox(textState, strLength);
@@ -766,7 +770,7 @@ StatefulString StatefulString::GetTrimmedBegin() const
                 break;
             }
 
-            length += Lengths[i];
+            length += RawLengths[i];
         }
 
         state.T_m.Apply<Tx>(length);
@@ -830,7 +834,7 @@ StatefulString StatefulString::GetTrimmedEnd() const
         }
     }
     return StatefulString(std::move(trimmedStr), State,
-        { Lengths.begin(), Lengths.begin() + positionIndexLimit },
+        { RawLengths.begin(), RawLengths.begin() + positionIndexLimit },
         { StringPositions.begin(), StringPositions.begin() + positionIndexLimit });
 }
 
@@ -854,12 +858,10 @@ double StatefulString::GetLength() const
 
 vector<double> StatefulString::computeLengths(const vector<double>& rawLengths)
 {
-    // NOTE: the lengths are transformed accordingly to text state but
-    // are not CTM transformed
     vector<double> ret;
     ret.reserve(rawLengths.size());
     for (unsigned i = 0; i < rawLengths.size(); i++)
-        ret.push_back((Vector2(rawLengths[i], 0) * State.CTM.GetScalingRotation()).GetLength());
+        ret.push_back((Vector2(rawLengths[i], 0) * State.T_rm.GetScalingRotation()).GetLength());
 
     return ret;
 }
@@ -938,7 +940,7 @@ void ExtractionContext::cm_Operator(double a, double b, double c, double d, doub
     // matrix (CTM) by concatenating the specified matrix
     Matrix cm(a, b, c, d, e, f);
     States.Current->CTM = cm * States.Current->CTM;
-    States.Current->ComputeT_rm();
+    States.Current->ComputeDependentState();
 }
 
 void ExtractionContext::Tm_Operator(double a, double b, double c, double d, double e, double f)
@@ -1085,7 +1087,11 @@ bool ExtractionContext::areChunksSpaced(double& distance)
     // 3) Handle vertical scripts (HARD)
     // 4) Try to avoid computing GetLength() and use only dot product
     auto curr = States.Current->T_rm.GetTranslationVector();
-    auto prev_curr = curr - PrevChunkT_rm_Pos;
+    const auto& previous = getPreviouString().State;
+    const auto previousSpacing = Vector2(previous.PdfState.CharSpacing * previous.PdfState.FontScale, 0)
+        * previous.T_rm.GetScalingRotation();
+    auto previousEnd = PrevChunkT_rm_Pos - previousSpacing;
+    auto prev_curr = curr - previousEnd;
     distance = prev_curr.GetLength();
 
     // Use actual text direction from T_rm instead of hardcoded (1,0)
@@ -1106,7 +1112,7 @@ bool ExtractionContext::areChunksSpaced(double& distance)
     if (dot1 < 0 && spaced)
     {
         auto& prevString = getPreviouString();
-        auto prev_init = prevString.Position - PrevChunkT_rm_Pos;
+        auto prev_init = prevString.Position - previousEnd;
         double dot2 = prev_init.Dot(textDir);
         return dot1 < dot2;
     }
@@ -1162,7 +1168,7 @@ void splitStringBySpaces(vector<StatefulString>& separatedStrings, const Statefu
         getSubstringIndices(str.StringPositions, lowerPos, upperPosLim, lowerPosIndex, upperPosLimIndex);
         double length = 0;
         for (unsigned i = lowerPosIndex; i < upperPosLimIndex; i++)
-            length += str.Lengths[i];
+            length += str.RawLengths[i];
 
         // Fixed string positions after split
         auto positions = vector<unsigned>(str.StringPositions.begin() + lowerPosIndex, str.StringPositions.begin() + upperPosLimIndex);
@@ -1170,7 +1176,7 @@ void splitStringBySpaces(vector<StatefulString>& separatedStrings, const Statefu
             positions[i] -= lowerPos;
 
         separatedStrings.push_back(StatefulString(std::move(separatedStr), state,
-            { str.Lengths.begin() + lowerPosIndex, str.Lengths.begin() + upperPosLimIndex },
+            { str.RawLengths.begin() + lowerPosIndex, str.RawLengths.begin() + upperPosLimIndex },
             std::move(positions)));
         lowerPos = previousPos;
         upperPosLim = (unsigned)str.String.length();
@@ -1183,14 +1189,23 @@ void splitStringBySpaces(vector<StatefulString>& separatedStrings, const Statefu
     bool isPreviousWhiteSpace = true;
     auto it = str.String.begin();
     auto end = str.String.end();
+    const auto& fontState = str.State.PdfState;
+    const double spaceWidth = fontState.Font == nullptr ? fontState.FontSize * 0.25
+        : fontState.Font->GetCharLength(U' ', fontState, true);
+    const bool spacedGlyphs = fontState.CharSpacing * fontState.FontScale
+        > std::max(std::abs(fontState.FontSize * fontState.FontScale) * 0.25, spaceWidth);
     do
     {
         char32_t cp = utf8::next(it, end);
         bool isCurrentWhiteSpace = utls::IsWhiteSpace(cp);
-        if (separatedStr.length() != 0 && isCurrentWhiteSpace != isPreviousWhiteSpace)
+        const bool gap = spacedGlyphs && !isCurrentWhiteSpace && !isPreviousWhiteSpace
+            && std::binary_search(str.StringPositions.begin(), str.StringPositions.end(), previousPos);
+        if (separatedStr.length() != 0 && (isCurrentWhiteSpace != isPreviousWhiteSpace || gap))
         {
             upperPosLim = previousPos;
             pushString();
+            if (gap)
+                separatedStrings.emplace_back(" ", state, vector<double>{0}, vector<unsigned>{0});
         }
 
         utf8::unchecked::append((uint32_t)cp, std::back_inserter(separatedStr));
@@ -1288,8 +1303,9 @@ void TextState::ComputeDependentState()
 
 void TextState::ComputeSpaceDescriptors()
 {
-    WordSpacingLength = (WordSpacingVectorRaw * T_m.GetScalingRotation()).GetLength();
-    HardSpacingLength = (HardSpacingVectorRaw * T_m.GetScalingRotation()).GetLength();
+    const auto transform = (T_m * CTM).GetScalingRotation();
+    WordSpacingLength = (WordSpacingVectorRaw * transform).GetLength();
+    HardSpacingLength = (HardSpacingVectorRaw * transform).GetLength();
 }
 
 void TextState::ComputeT_rm()
@@ -1299,12 +1315,16 @@ void TextState::ComputeT_rm()
 
 double TextState::GetWordSpacingLength() const
 {
-    return PdfState.Font->GetWordSpacingLength(PdfState);
+    auto state = PdfState;
+    state.CharSpacing = 0;
+    return state.Font->GetWordSpacingLength(state);
 }
 
 double TextState::GetHardSpacingLength() const
 {
-    return PdfState.Font->GetHardSpacingLength(PdfState);
+    auto state = PdfState;
+    state.CharSpacing = 0;
+    return state.Font->GetHardSpacingLength(state);
 }
 
 double TextState::GetSpaceCharLength() const
